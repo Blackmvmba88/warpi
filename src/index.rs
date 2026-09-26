@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillCategory {
@@ -18,7 +19,7 @@ pub struct UserIndex {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AIIndex {
-    /// Historial de comandos donde la IA tuvo que intervenir (traducciones o sugerencias de error)
+    /// Historial de intervenciones de la IA (traducciones o correcciones)
     pub interventions: HashMap<String, SkillCategory>,
     pub total_interventions: u32,
 }
@@ -32,6 +33,33 @@ pub struct ProfileTracker {
 impl ProfileTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn storage_path() -> PathBuf {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(".warp_profile.json")
+        } else {
+            PathBuf::from(".warp_profile.json")
+        }
+    }
+
+    /// Carga el perfil persistido automáticamente o crea uno nuevo
+    pub fn load_or_default() -> Self {
+        let path = Self::storage_path();
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(tracker) = serde_json::from_str(&data) {
+                return tracker;
+            }
+        }
+        Self::new()
+    }
+
+    /// Guarda automáticamente el perfil en disco
+    pub fn save(&self) {
+        let path = Self::storage_path();
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, data);
+        }
     }
 
     /// Analiza el comando base (ej. "git commit" -> "git")
@@ -49,6 +77,7 @@ impl ProfileTracker {
             ai_assisted: 0,
         });
         entry.manual_successes += 1;
+        self.save();
     }
 
     pub fn record_manual_failure(&mut self, command: &str) {
@@ -61,13 +90,13 @@ impl ProfileTracker {
             ai_assisted: 0,
         });
         entry.manual_failures += 1;
+        self.save();
     }
 
     pub fn record_ai_assistance(&mut self, command: &str) {
         let tool = Self::extract_tool(command);
         self.ai.total_interventions += 1;
-        
-        // Registramos también en las stats del usuario que necesitó ayuda con esta herramienta
+
         let user_entry = self.user.skills.entry(tool.clone()).or_insert(SkillCategory {
             name: tool.clone(),
             manual_successes: 0,
@@ -83,5 +112,27 @@ impl ProfileTracker {
             ai_assisted: 0,
         });
         ai_entry.ai_assisted += 1;
+        self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_profile_tracker_skills() {
+        let mut tracker = ProfileTracker::new();
+        tracker.record_manual_success("cargo build");
+        tracker.record_manual_failure("cargo test");
+        tracker.record_ai_assistance("cargo run");
+
+        assert_eq!(tracker.user.total_commands_typed, 2);
+        assert_eq!(tracker.ai.total_interventions, 1);
+
+        let cargo = tracker.user.skills.get("cargo").unwrap();
+        assert_eq!(cargo.manual_successes, 1);
+        assert_eq!(cargo.manual_failures, 1);
+        assert_eq!(cargo.ai_assisted, 1);
     }
 }

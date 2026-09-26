@@ -16,6 +16,7 @@ pub struct CommandBlock {
     pub output: String,
     pub status: BlockStatus,
     pub ai_suggestion: Option<String>,
+    pub suggested_fix: Option<String>,
 }
 
 impl CommandBlock {
@@ -28,6 +29,7 @@ impl CommandBlock {
             output: String::new(),
             status: BlockStatus::Pending,
             ai_suggestion: None,
+            suggested_fix: None,
         }
     }
 
@@ -70,4 +72,3 @@ mod tests {
         assert_eq!(block.status, BlockStatus::Error(1));
     }
 }
-

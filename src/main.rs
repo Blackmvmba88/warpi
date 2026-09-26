@@ -23,19 +23,23 @@ use ui::{render_ui, AppState};
 enum AppEvent {
     Input(Event),
     Tick,
-    CommandResult {
+    CommandChunk {
+        block_id: usize,
+        chunk: String,
+    },
+    CommandFinished {
         block_id: usize,
         command: String,
-        output: String,
         exit_code: i32,
     },
     AiTranslationResult {
         original: String,
         translated: String,
     },
-    AiExplanationResult {
+    AiDiagnosticResult {
         block_id: usize,
         explanation: String,
+        suggested_cmd: Option<String>,
     },
 }
 
@@ -46,14 +50,14 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut state = AppState::new();
     let ai = Arc::new(AIAssistant::new());
+    let mut state = AppState::new(ai.provider_name());
     let mut block_counter = 1;
 
-    // EL CORAZÓN ASÍNCRONO: mpsc channel
-    let (tx, mut rx) = mpsc::channel(100);
+    // CANAL PRINCIPAL DE COMUNICACIÓN ASÍNCRONA
+    let (tx, mut rx) = mpsc::channel(200);
 
-    // HILO 1: Captura de Teclado Continua (No bloqueante)
+    // HILO PRODUCTOR: Captura de Teclado y Ticks sin bloqueo
     let tx_input = tx.clone();
     tokio::spawn(async move {
         loop {
@@ -67,7 +71,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // BUCLE PRINCIPAL (UI y Recepción de Eventos)
+    // BUCLE PRINCIPAL DE INTERFAZ Y DESPACHO REACTIVO
     loop {
         terminal.draw(|f| render_ui(f, &state))?;
 
@@ -81,11 +85,33 @@ async fn main() -> Result<()> {
                         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                             state.ai_mode = !state.ai_mode;
                             if state.ai_mode {
-                                state.ai_status = "Modo IA activo. Ingresa lenguaje natural.".to_string();
+                                state.ai_status = "Modo Asistente IA activo. Escribe lo que deseas hacer en español o inglés.".to_string();
                             } else {
-                                state.ai_status = "Modo Terminal activo.".to_string();
+                                state.ai_status = "Modo Terminal interactivo activo.".to_string();
                             }
                         }
+
+                        // Auto-remediación: con Tab se carga la solución sugerida por la IA
+                        (KeyCode::Tab, _) => {
+                            state.apply_pending_fix();
+                        }
+
+                        // Navegación en historial de comandos
+                        (KeyCode::Up, _) => {
+                            state.history_up();
+                        }
+                        (KeyCode::Down, _) => {
+                            state.history_down();
+                        }
+
+                        // Scroll en bloques de salida
+                        (KeyCode::PageUp, _) => {
+                            state.scroll_up();
+                        }
+                        (KeyCode::PageDown, _) => {
+                            state.scroll_down();
+                        }
+
                         (KeyCode::Backspace, _) => {
                             state.input.pop();
                         }
@@ -95,13 +121,15 @@ async fn main() -> Result<()> {
                         (KeyCode::Enter, _) => {
                             let user_input = state.input.trim().to_string();
                             state.input.clear();
+                            state.history_idx = None;
+
                             if user_input.is_empty() {
                                 continue;
                             }
 
                             if state.ai_mode {
-                                // ASYNC IA TRANSLATION
-                                state.ai_status = format!("Consultando IA para: '{}'...", user_input);
+                                // TRADUCCIÓN ASÍNCRONA DE LENGUAJE NATURAL
+                                state.ai_status = format!("🤖 Consultando IA para '{}'...", user_input);
                                 let tx_ai = tx.clone();
                                 let ai_clone = Arc::clone(&ai);
                                 tokio::spawn(async move {
@@ -113,7 +141,10 @@ async fn main() -> Result<()> {
                                 });
                                 state.ai_mode = false;
                             } else {
-                                // ASYNC PTY EXECUTION
+                                // REGISTRO Y EJECUCIÓN STREAMING EN PTY
+                                state.history.push(user_input.clone());
+                                state.pending_fix = None;
+
                                 let mut block = CommandBlock::new(block_counter, user_input.clone());
                                 block.status = crate::block::BlockStatus::Running;
                                 state.blocks.push(block);
@@ -123,15 +154,30 @@ async fn main() -> Result<()> {
 
                                 let tx_cmd = tx.clone();
                                 let cmd = user_input.clone();
+
                                 tokio::task::spawn_blocking(move || {
-                                    let (output, exit_code) = match ShellRunner::run_command(&cmd) {
-                                        Ok((o, c)) => (o, c),
-                                        Err(e) => (format!("Error interno: {}", e), 1),
+                                    let tx_chunk = tx_cmd.clone();
+                                    let res = ShellRunner::run_command_streaming(&cmd, |chunk| {
+                                        let _ = tx_chunk.blocking_send(AppEvent::CommandChunk {
+                                            block_id: current_block_id,
+                                            chunk,
+                                        });
+                                    });
+
+                                    let exit_code = match res {
+                                        Ok(code) => code,
+                                        Err(e) => {
+                                            let _ = tx_cmd.blocking_send(AppEvent::CommandChunk {
+                                                block_id: current_block_id,
+                                                chunk: format!("\nError ejecutando PTY: {}", e),
+                                            });
+                                            1
+                                        }
                                     };
-                                    let _ = tx_cmd.blocking_send(AppEvent::CommandResult {
+
+                                    let _ = tx_cmd.blocking_send(AppEvent::CommandFinished {
                                         block_id: current_block_id,
                                         command: cmd,
-                                        output,
                                         exit_code,
                                     });
                                 });
@@ -142,57 +188,80 @@ async fn main() -> Result<()> {
                 }
                 AppEvent::Input(_) => {}
                 AppEvent::Tick => {}
-                AppEvent::CommandResult {
+
+                // SALIDA EN TIEMPO REAL (Streaming)
+                AppEvent::CommandChunk { block_id, chunk } => {
+                    if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
+                        block.append_output(&chunk);
+                    }
+                }
+
+                // COMANDO FINALIZADO
+                AppEvent::CommandFinished {
                     block_id,
                     command,
-                    output,
                     exit_code,
                 } => {
-                    // Update Block
+                    let mut block_output = String::new();
                     if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                        block.append_output(&output);
                         block.mark_finished(exit_code);
+                        block_output = block.output.clone();
                     }
 
-                    // Update Tracker
                     if exit_code == 0 {
                         state.tracker.record_manual_success(&command);
-                        state.ai_status = format!("Comando `{}` ejecutado con éxito.", command);
+                        state.ai_status = format!("✅ `{}` finalizó exitosamente.", command);
                     } else {
                         state.tracker.record_manual_failure(&command);
-                        state.ai_status = format!("Comando `{}` falló. Consultando IA...", command);
+                        state.ai_status = format!("❌ `{}` falló (código {}). Diagnosticando solución autónomamente...", command, exit_code);
 
-                        // ASYNC ERROR EXPLANATION
+                        // DIAGNÓSTICO AUTÓNOMO CON SUGERENCIA DE FIX
                         let tx_ai = tx.clone();
                         let ai_clone = Arc::clone(&ai);
                         let cmd_clone = command.clone();
-                        let out_clone = output.clone();
                         tokio::spawn(async move {
-                            let explanation = ai_clone.explain_error(&cmd_clone, &out_clone, exit_code).await;
-                            let _ = tx_ai.send(AppEvent::AiExplanationResult {
+                            let diag = ai_clone.diagnose_error(&cmd_clone, &block_output, exit_code).await;
+                            let _ = tx_ai.send(AppEvent::AiDiagnosticResult {
                                 block_id,
-                                explanation,
+                                explanation: diag.explanation,
+                                suggested_cmd: diag.suggested_cmd,
                             }).await;
                         });
                     }
                 }
+
+                // RESULTADO DE TRADUCCIÓN IA
                 AppEvent::AiTranslationResult { original, translated } => {
                     state.tracker.record_ai_assistance(&original);
                     state.input = translated.clone();
-                    state.ai_status = format!("IA sugiere: `{}`. Presiona Enter para ejecutar.", translated);
+                    state.ai_status = format!("🤖 IA sugiere: `{}`. Presiona Enter para ejecutar.", translated);
                 }
-                AppEvent::AiExplanationResult { block_id, explanation } => {
+
+                // RESULTADO DE DIAGNÓSTICO AUTÓNOMO
+                AppEvent::AiDiagnosticResult {
+                    block_id,
+                    explanation,
+                    suggested_cmd,
+                } => {
                     if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
                         block.ai_suggestion = Some(explanation.clone());
+                        block.suggested_fix = suggested_cmd.clone();
                     }
-                    state.ai_status = "💡 Sugerencia IA recibida. Revisa el bloque.".to_string();
+
+                    if let Some(fix) = suggested_cmd {
+                        state.pending_fix = Some(fix.clone());
+                        state.ai_status = format!("💡 Causa: {}. Presiona [Tab] para autocompletar corrección.", explanation);
+                    } else {
+                        state.ai_status = format!("💡 Diagnóstico: {}", explanation);
+                    }
                 }
             }
         }
     }
 
+    // Restauración limpia de la terminal
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
-    println!("¡Gracias por usar Warp Rust CLI V2 (Async Edition)!");
+    println!("¡Gracias por usar Warp Rust CLI!");
     Ok(())
 }

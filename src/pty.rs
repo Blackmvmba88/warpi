@@ -5,11 +5,14 @@ use std::io::Read;
 pub struct ShellRunner;
 
 impl ShellRunner {
-    pub fn run_command(cmd_str: &str) -> Result<(String, i32)> {
+    pub fn run_command_streaming<F>(cmd_str: &str, mut on_chunk: F) -> Result<i32>
+    where
+        F: FnMut(String),
+    {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: 30,
+            cols: 120,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -23,7 +26,6 @@ impl ShellRunner {
         drop(pair.slave); // Drop slave so reader gets EOF when child terminates
 
         let mut reader = pair.master.try_clone_reader()?;
-        let mut output = String::new();
         let mut buf = [0u8; 1024];
 
         while let Ok(n) = reader.read(&mut buf) {
@@ -31,17 +33,19 @@ impl ShellRunner {
                 break;
             }
             let s = String::from_utf8_lossy(&buf[..n]);
-            output.push_str(&s);
+            let cleaned_bytes = strip_ansi_escapes::strip(&s);
+            let cleaned_str = String::from_utf8_lossy(&cleaned_bytes)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            if !cleaned_str.is_empty() {
+                on_chunk(cleaned_str);
+            }
         }
 
         let status = child.wait()?;
         let exit_code = if status.success() { 0 } else { 1 };
 
-        // Clean up VT100 / ANSI escape sequences if needed
-        let cleaned_bytes = strip_ansi_escapes::strip(&output);
-        let cleaned_output = String::from_utf8_lossy(&cleaned_bytes).to_string();
-
-        Ok((cleaned_output, exit_code))
+        Ok(exit_code)
     }
 }
 
