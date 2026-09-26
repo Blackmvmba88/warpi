@@ -1,4 +1,5 @@
 use crate::block::{BlockStatus, CommandBlock};
+use crate::index::ProfileTracker;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -13,6 +14,7 @@ pub struct AppState {
     pub selected_block_idx: Option<usize>,
     pub ai_status: String,
     pub ai_mode: bool,
+    pub tracker: ProfileTracker,
 }
 
 impl AppState {
@@ -23,6 +25,7 @@ impl AppState {
             selected_block_idx: None,
             ai_status: "IA lista. Presiona Ctrl+A para modo Consulta IA o escribe un comando.".to_string(),
             ai_mode: false,
+            tracker: ProfileTracker::new(),
         }
     }
 }
@@ -73,7 +76,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_main_body(frame: &mut Frame, area: Rect, state: &AppState) {
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
 
     // Left: Blocks History
@@ -94,12 +97,11 @@ fn render_main_body(frame: &mut Frame, area: Rect, state: &AppState) {
 
         list_items.push(ListItem::new(header_line));
 
-        // Output lines snippet
         if !block.output.is_empty() {
             let output_preview: String = block
                 .output
                 .lines()
-                .take(4)
+                .take(6)
                 .map(|l| format!("  │ {}", l))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -110,11 +112,10 @@ fn render_main_body(frame: &mut Frame, area: Rect, state: &AppState) {
             ))));
         }
 
-        // AI Suggestion snippet if present
         if let Some(ref suggestion) = block.ai_suggestion {
             list_items.push(ListItem::new(Line::from(Span::styled(
-                format!("  └─ {}", suggestion),
-                Style::default().fg(Color::Magenta),
+                format!("  └─ 💡 Sugerencia IA: {}", suggestion),
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ))));
         }
 
@@ -126,21 +127,29 @@ fn render_main_body(frame: &mut Frame, area: Rect, state: &AppState) {
 
     frame.render_widget(blocks_list, body_chunks[0]);
 
-    // Right: AI Assistant & Web panel
-    let ai_text = vec![
-        Line::from(Span::styled("🤖 Asistente IA & Web", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
+    // Right: AI Assistant & Profile Tracker
+    let mut ai_text = vec![
+        Line::from(Span::styled("🤖 Asistente IA & Skills", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))),
         Line::from(Span::raw("-------------------------")),
         Line::from(Span::styled(&state.ai_status, Style::default().fg(Color::LightCyan))),
         Line::from(Span::raw("")),
-        Line::from(Span::styled("Índice de Comparación Warp:", Style::default().fg(Color::Yellow))),
-        Line::from(Span::styled("• UI por Bloques: ACTIVO ✅", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("• PTY Shell Integration: ACTIVO ✅", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("• Diagnóstico IA: ACTIVO ✅", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("• Workflows: Próximamente ⏳", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(format!("📊 Índice de Nivel (Exp Total: {})", state.tracker.user.total_commands_typed), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
     ];
 
+    for (tool, stats) in &state.tracker.user.skills {
+        ai_text.push(Line::from(vec![
+            Span::styled(format!("• {}: ", tool), Style::default().fg(Color::White)),
+            Span::styled(format!("✅{} ", stats.manual_successes), Style::default().fg(Color::Green)),
+            Span::styled(format!("❌{} ", stats.manual_failures), Style::default().fg(Color::Red)),
+            Span::styled(format!("🤖{}", stats.ai_assisted), Style::default().fg(Color::Magenta)),
+        ]));
+    }
+
+    ai_text.push(Line::from(Span::raw("")));
+    ai_text.push(Line::from(Span::styled("Warp Engine: Async mpsc ACTIVO 🚀", Style::default().fg(Color::Green))));
+
     let ai_panel = Paragraph::new(ai_text)
-        .block(RataBlock::default().borders(Borders::ALL).title(" Asistencia en Tiempo Real "))
+        .block(RataBlock::default().borders(Borders::ALL).title(" Perfil & Asistencia "))
         .wrap(Wrap { trim: true });
 
     frame.render_widget(ai_panel, body_chunks[1]);
@@ -148,7 +157,7 @@ fn render_main_body(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_input_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let (prompt, style) = if state.ai_mode {
-        ("🤖 Preguntar a la IA > ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        ("🤖 Traducción IA > ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
     } else {
         ("❯ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
     };
@@ -159,7 +168,7 @@ fn render_input_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     ]);
 
     let input_widget = Paragraph::new(input_line)
-        .block(RataBlock::default().borders(Borders::ALL).title(" Entrada "));
+        .block(RataBlock::default().borders(Borders::ALL).title(" Entrada (Escribe un comando) "));
 
     frame.render_widget(input_widget, area);
 }
